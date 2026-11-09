@@ -25,6 +25,10 @@ var (
 	buildTopologyGraph = topology.BuildGraph
 	writeTopologyCache = topology.WriteCacheAt
 	buildFileGraph     = scanner.BuildFileGraph
+	// newFileWatcher and scanAllFiles are seams so watch-failure recovery can
+	// be exercised with injected subscription and scan failures.
+	newFileWatcher = fsnotify.NewWatcher
+	scanAllFiles   = scanner.ScanFiles
 )
 
 // Daemon is the watch daemon that keeps the graph updated
@@ -63,6 +67,15 @@ type Daemon struct {
 	// batch is non-nil only while handleBurst is flushing a checkout storm;
 	// handleEvent then records per-file work on it instead of doing it.
 	batch *burstBatch
+
+	// Watch-failure recovery state. Like dependencyBusy, these fields are
+	// owned by the event loop; trust itself lives on Graph under graph.mu so
+	// readers and the publisher can observe it concurrently.
+	recovering            bool
+	awaitingGraphRecovery bool
+	recoveryAttempts      int
+	recoveryTimer         *time.Timer
+	recoveryTimerC        <-chan time.Time
 }
 
 type dependencyGraphSnapshot struct {
@@ -152,6 +165,7 @@ func NewDaemon(root string, verbose bool) (*Daemon, error) {
 			Events:          make([]Event, 0),
 			WorkingSet:      NewWorkingSet(),
 			IsGitRepo:       isGitRepo,
+			trust:           DataTrustTrusted,
 		},
 	}
 	instance, err := newDaemonInstance()
@@ -342,7 +356,7 @@ func (d *Daemon) fullScan() error {
 	start := time.Now()
 	cfg := d.loadConfig()
 
-	files, err := scanner.ScanFiles(context.Background(), d.root, d.gitCache, nil, nil)
+	files, err := scanAllFiles(context.Background(), d.root, d.gitCache, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -527,6 +541,7 @@ func (d *Daemon) handleDependencyGraphResult(result dependencyGraphResult) {
 	if retry {
 		d.refreshDependencies()
 	}
+	d.settleRecoveryAfterGraphResult(retry)
 }
 
 // computeDeps builds the file-to-file dependency graph
@@ -628,8 +643,15 @@ func (d *Daemon) markGraphLifecycleLocked(state GraphState) {
 	d.graph.DepCtx = make(map[string]*DepContext)
 }
 
-// addWatchDirs recursively adds directories to the watcher
+// addWatchDirs recursively adds directories to the daemon's watcher.
 func (d *Daemon) addWatchDirs() error {
+	return d.addWatchDirsTo(d.watcher)
+}
+
+// addWatchDirsTo replays the directory subscriptions onto an arbitrary
+// watcher. Recovery builds the replacement watcher and populates it before
+// swapping, so the old subscription set stays live until the new one is ready.
+func (d *Daemon) addWatchDirsTo(watcher *fsnotify.Watcher) error {
 	return filepath.Walk(d.root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // skip errors
@@ -650,7 +672,7 @@ func (d *Daemon) addWatchDirs() error {
 			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" {
 				return filepath.SkipDir
 			}
-			return d.watcher.Add(path)
+			return watcher.Add(path)
 		}
 		return nil
 	})

@@ -319,6 +319,7 @@ func (d *Daemon) eventLoop() {
 			d.handleBurst(burst.take())
 		}
 	}()
+	defer d.stopRecoveryTimer()
 
 	for {
 		select {
@@ -337,6 +338,12 @@ func (d *Daemon) eventLoop() {
 
 		case <-controlTimerC:
 			refreshConfigured()
+
+		case <-d.recoveryTimerC:
+			// The channel is consumed here; stopRecoveryTimer clears the
+			// field so a fired-and-handled timer blocks on nil afterwards.
+			d.recoveryTimerC = nil
+			d.attemptRecovery()
 
 		case result := <-d.dependencyResults:
 			d.handleDependencyGraphResult(result)
@@ -420,10 +427,10 @@ func (d *Daemon) eventLoop() {
 			if !ok {
 				return
 			}
-			if d.verbose {
-				fmt.Printf("[watch] Error: %v\n", err)
-			}
-			d.reportPublicationError(d.publisher.failPending("watch_error"))
+			// A watcher error means events may have been lost: withdraw
+			// trust, rebuild subscriptions and cold-scan reconcile instead
+			// of only failing the pending flush.
+			d.handleWatchError(err)
 		}
 	}
 }

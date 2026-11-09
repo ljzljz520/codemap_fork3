@@ -84,7 +84,11 @@ func (p *statePublisher) snapshot(generation uint64) State {
 	}
 	root := canonicalRoot(d.root)
 	graphState := d.graph.GraphState
-	s := State{Root: root, CanonicalRoot: root, DaemonInstance: p.instance, Generation: generation, UpdatedAt: time.Now(), FileCount: len(d.graph.Files), ConfiguredFileCount: &configuredFileCount, Hubs: []string{}, Importers: map[string][]string{}, Imports: map[string][]string{}, RecentEvents: append([]Event(nil), events...), WorkingSet: d.graph.WorkingSet.Snapshot(50), Graph: &graphState}
+	trust := d.graph.trust
+	if trust == "" {
+		trust = DataTrustTrusted
+	}
+	s := State{Root: root, CanonicalRoot: root, DaemonInstance: p.instance, Generation: generation, UpdatedAt: time.Now(), FileCount: len(d.graph.Files), ConfiguredFileCount: &configuredFileCount, Hubs: []string{}, Importers: map[string][]string{}, Imports: map[string][]string{}, RecentEvents: append([]Event(nil), events...), WorkingSet: d.graph.WorkingSet.Snapshot(50), Graph: &graphState, DataTrust: trust}
 	if d.graph.FileGraph != nil {
 		s.Hubs = d.graph.FileGraph.HubFiles()
 		s.Importers = d.graph.FileGraph.Importers
@@ -112,6 +116,12 @@ func (p *statePublisher) publish() error {
 	p.generation = next
 	p.dirty = false
 	p.deadline = time.Time{}
+	// Flush requests may only confirm trusted results: while the daemon is
+	// reconciling lost events, fail them instead of acknowledging the
+	// untrusted snapshot. Callers retry once recovery publishes again.
+	if p.daemon.trustStatus() == DataTrustRecovering {
+		return p.failPending(flushErrWatchRecovering)
+	}
 	var ackErr error
 	for nonce, req := range p.pending {
 		ackErr = errors.Join(ackErr, p.writeAck(req, flushAck{Version: flushProtocolVersion, CanonicalRoot: req.CanonicalRoot, DaemonInstance: req.DaemonInstance, Nonce: req.Nonce, ObservedGeneration: req.ObservedGeneration, PublishedGeneration: next, Timestamp: time.Now().UTC(), Success: true}))

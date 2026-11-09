@@ -40,6 +40,17 @@ type DepContext struct {
 	Importers []string // files that import this file
 }
 
+// DataTrust reports whether the daemon's in-memory inventory is known to
+// match disk. A watcher error (event queue overflow, failed subscription)
+// means an unknown number of events were lost, so every derived structure
+// stays DataTrustRecovering until a cold scan reconciles it against disk.
+type DataTrust string
+
+const (
+	DataTrustTrusted    DataTrust = "trusted"
+	DataTrustRecovering DataTrust = "recovering"
+)
+
 // Graph holds the live code graph state
 type Graph struct {
 	mu               sync.RWMutex
@@ -58,6 +69,15 @@ type Graph struct {
 	HasDeps          bool // whether deps were successfully computed
 	GraphState       GraphState
 	graphGeneration  uint64
+	// trust is DataTrustTrusted while the inventory is known to match disk.
+	// The zero value is treated as trusted so Graph literals built by tests
+	// and pre-recovery daemons keep their old semantics.
+	trust DataTrust
+	// recoveryGeneration increments each time watch-failure recovery starts.
+	// It orders reconciliation generations the same way graphGeneration
+	// orders dependency builds, so work started before the loss can never be
+	// published over the reconciled state.
+	recoveryGeneration uint64
 }
 
 // State represents the daemon state that hooks can read
@@ -76,6 +96,17 @@ type State struct {
 	WorkingSet          *WorkingSet           `json:"working_set,omitempty"`
 	Coverage            scanner.GraphCoverage `json:"coverage,omitempty"`
 	Graph               *GraphState           `json:"graph,omitempty"`
+	// DataTrust is "recovering" while the daemon is reconciling lost watch
+	// events; hooks and flush clients must not treat such a snapshot as
+	// authoritative even if its counts look plausible.
+	DataTrust DataTrust `json:"data_trust,omitempty"`
+}
+
+// Trusted reports whether the snapshot may be treated as authoritative.
+// State written before data_trust existed defaults to trusted: only an
+// explicit recovering marker withdraws trust.
+func (s *State) Trusted() bool {
+	return s == nil || s.DataTrust == "" || s.DataTrust == DataTrustTrusted
 }
 
 // ConfiguredCount returns the persisted count for the active project filters.
